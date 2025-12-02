@@ -1,0 +1,10 @@
+__pycache__/
+.venv/
+controls/
+current_weather_reports/
+forecast_weather_reports/
+news_reports/
+news_reports_full/
+old/
+past_data_verification/
+.env
