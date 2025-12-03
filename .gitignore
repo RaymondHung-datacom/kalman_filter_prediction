@@ -8,3 +8,6 @@ news_reports_full/
 old/
 past_data_verification/
 .env
+sales_data.csv
+queries.txt
+kalman_filter_state.json
