@@ -11,3 +11,5 @@ past_data_verification/
 sales_data.csv
 queries.txt
 kalman_filter_state.json
+kalman_filter_states.json
+predictions.json

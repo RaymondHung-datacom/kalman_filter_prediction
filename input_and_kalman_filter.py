@@ -307,7 +307,8 @@ def get_weekly_news_context(target_date_iso):
 # ==========================================
 # 4. KALMAN FILTER ENGINE
 # ==========================================
-STATE_FILE = "kalman_filter_state.json"
+STATE_FILE = "kalman_filter_states.json"
+PREDICTIONS_FILE = "predictions.json"
 
 class RetailKalmanFilter:
     def __init__(self):
@@ -377,6 +378,124 @@ class RetailKalmanFilter:
             print(f"⚠️  Failed to load state: {e}")
             return False
 
+def load_states(filepath=STATE_FILE):
+    """Load filter states for all SKUs (returns dict sku -> {'x':..., 'P':...})"""
+    if os.path.exists(filepath):
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                return json.load(f) or {}
+        except Exception:
+            return {}
+    return {}
+
+def save_states(states, filepath=STATE_FILE):
+    """Save filter states dict (sku -> state)"""
+    try:
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(states, f, indent=2, ensure_ascii=False)
+        print(f"💾 Saved Kalman states to {filepath}")
+    except Exception as e:
+        print(f"❌ Failed to save Kalman states: {e}")
+
+def get_filter_for_sku(sku, states):
+    """
+    Return a RetailKalmanFilter instance initialized from saved state for sku (if exists).
+    The caller should call predict/update on the returned object. The returned filter's
+    current x,P will be in its attributes for saving later.
+    """
+    kf = RetailKalmanFilter()
+    state = states.get(sku)
+    if state:
+        try:
+            kf.x = np.array(state["x"])
+            kf.P = np.array(state["P"])
+        except Exception:
+            pass
+    return kf
+
+def load_sales_map_for_today(filepath="sales_data.csv"):
+    """
+    Returns (sku_list, sales_map) for today's date:
+      - sku_list: list of SKUs to produce predictions (all SKUs seen in file for today,
+                  or all SKUs in file if today not present)
+      - sales_map: dict sku -> sales_count (only for today's rows)
+    """
+    try:
+        import pandas as pd
+        df = pd.read_csv(filepath, dtype={"date": str})
+        today = datetime.now().strftime("%Y-%m-%d")
+        df_today = df[df["date"] == today]
+        if df_today.empty:
+            # fallback: use latest date available
+            if df.empty:
+                return [], {}
+            latest_date = df["date"].max()
+            df_latest = df[df["date"] == latest_date]
+            sku_list = df_latest["item_id"].unique().tolist()
+            return sku_list, {}
+        sku_list = df_today["item_id"].unique().tolist()
+        sales_map = df_today.groupby("item_id")["sales_count"].sum().to_dict()
+        return sku_list, {k: float(v) for k, v in sales_map.items()}
+    except FileNotFoundError:
+        print(f"⚠️  Sales CSV not found: {filepath}")
+        return [], {}
+    except Exception as e:
+        print(f"⚠️  Failed to load sales CSV: {e}")
+        return [], {}
+
+def save_prediction(obs_time_iso, pred_before, pred_after=None, measurement=None, filepath=PREDICTIONS_FILE):
+    """
+    Save or update today's prediction record.
+    pred_before / pred_after / measurement may be:
+      - dict keyed by SKU
+      - scalar (float) representing total -> stored under key "__TOTAL__"
+      - None
+    Overwrites the entry for the same date so repeated runs update the record.
+    """
+    def _normalize_entry(entry):
+        if entry is None:
+            return None
+        if isinstance(entry, dict):
+            return {k: float(v) for k, v in entry.items()}
+        # scalar -> store under reserved key
+        try:
+            return {"__TOTAL__": float(entry)}
+        except Exception:
+            return None
+
+    try:
+        date_key = datetime.fromisoformat(obs_time_iso).date().isoformat()
+    except Exception:
+        date_key = datetime.now().date().isoformat()
+
+    record = {
+        "obs_time": obs_time_iso,
+        "run_timestamp": datetime.now().isoformat(),
+        "pred_before": _normalize_entry(pred_before),
+        "pred_after": _normalize_entry(pred_after),
+        "measurement": _normalize_entry(measurement)
+    }
+
+    # Load existing file (if any)
+    data = {}
+    if os.path.exists(filepath):
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                data = json.load(f) or {}
+        except Exception:
+            data = {}
+
+    # Update today's entry (overwrite so repeated runs update)
+    data[date_key] = record
+
+    # Save back
+    try:
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        print(f"💾 Prediction saved to {filepath} (date: {date_key})")
+    except Exception as e:
+        print(f"❌ Failed to save prediction: {e}")
+
 # ==========================================
 # 5. MAIN EXECUTION LOOP
 # ==========================================
@@ -419,6 +538,10 @@ if __name__ == "__main__":
     print(f"📈 Predicted Sales: {prediction[0,0]:.2f} units")
     print(f"🚀 Momentum:        {prediction[1,0]:.4f}")
     
+    # SAVE pre-measurement prediction (will be overwritten if run again today)
+    pred_before_val = float(prediction[0,0])
+    save_prediction(obs_time, pred_before=pred_before_val, pred_after=None, measurement=None)
+    
     # 5. LOAD & UPDATE WITH ACTUAL SALES
     print("\n📥 Loading Actual Sales:")
     actual_sales = load_actual_sales_from_csv("sales_data.csv")
@@ -431,7 +554,44 @@ if __name__ == "__main__":
         print(f"📊 Measurement:    {actual_sales:.0f} units")
         print(f"📈 Corrected Pred:  {updated[0,0]:.2f} units")
         print(f"🚀 Corrected Mom:   {updated[1,0]:.4f}")
+
+        # Save updated prediction (overwrites previous for the same date)
+        pred_after_val = float(updated[0,0])
+        save_prediction(obs_time, pred_before=pred_before_val, pred_after=pred_after_val, measurement=actual_sales)
     
     # 6. SAVE STATE
     kf.save_state()
     print("\n✅ Complete!")
+
+    # Prepare per-SKU prediction
+    states = load_states()
+    sku_list, sales_map = load_sales_map_for_today("sales_data.csv")
+    if not sku_list:
+        print("⚠️  No SKUs found to predict. Exiting.")
+        exit()
+
+    pred_before_dict = {}
+    pred_after_dict = {}
+    measurements_dict = {}
+
+    for sku in sku_list:
+        kf_sku = get_filter_for_sku(sku, states)
+        pred = kf_sku.predict(u_full)
+        pred_before_dict[sku] = float(pred[0, 0])
+
+        meas = sales_map.get(sku)
+        if meas is not None:
+            updated = kf_sku.update(meas)
+            pred_after_dict[sku] = float(updated[0, 0])
+            measurements_dict[sku] = float(meas)
+
+        # store/save the state back into states dict for this sku
+        states[sku] = {"x": kf_sku.x.tolist(), "P": kf_sku.P.tolist()}
+
+    # Save predictions (per-SKU). This will overwrite today's entry if rerun.
+    save_prediction(obs_time, pred_before=pred_before_dict, pred_after=pred_after_dict or None, measurement=measurements_dict or None)
+
+    # Persist all SKU states
+    save_states(states)
+
+    print("\n✅ Per-SKU prediction cycle complete.")
